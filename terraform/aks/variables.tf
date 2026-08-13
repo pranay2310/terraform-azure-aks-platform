@@ -42,3 +42,8 @@ variable "max_nodes" {
   description = "Maximum AKS nodes"
   type        = number
 }
+
+variable "acr_repository" {
+  description = "ACR repository that AKS can pull"
+  type        = string
+}
