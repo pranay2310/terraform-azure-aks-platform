@@ -1,0 +1,286 @@
+trigger:
+  - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+
+  # Azure DevOps service connection
+  azureServiceConnection: 'azure-aks-connection'
+
+  # ACR
+  acrName: 'pranayacr12345'
+  acrLoginServer: 'pranayacr12345.azurecr.io'
+  imageRepository: 'fastapi-gitops-demo'
+  imageTag: '$(Build.BuildId)'
+
+  # Terraform
+  terraformWorkingDirectory: 'terraform/aks'
+
+  # AKS
+  aksResourceGroup: 'rg-terraform-aks'
+  aksClusterName: 'aks-fastapi-terraform'
+
+
+stages:
+
+# ============================================================
+# STAGE 1 - TERRAFORM
+# ============================================================
+
+- stage: Terraform
+  displayName: Terraform Infrastructure
+
+  jobs:
+
+  - job: Terraform
+    displayName: Terraform Plan and Apply
+
+    steps:
+
+    - checkout: self
+
+    # --------------------------------------------------------
+    # Azure Login
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: Azure Login
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+
+        inlineScript: |
+          set -e
+
+          echo "Azure account:"
+          az account show
+
+    # --------------------------------------------------------
+    # Terraform Init
+    # --------------------------------------------------------
+
+    - task: TerraformInstaller@1
+      displayName: Install Terraform
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        terraform init
+      displayName: Terraform Init
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Terraform Validate
+    # --------------------------------------------------------
+
+    - script: |
+        terraform validate
+      displayName: Terraform Validate
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Terraform Plan
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: Terraform Plan
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          set -e
+
+          cd $(terraformWorkingDirectory)
+
+          terraform plan \
+            -out=tfplan
+
+    # --------------------------------------------------------
+    # Terraform Apply
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: Terraform Apply
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          set -e
+
+          cd $(terraformWorkingDirectory)
+
+          terraform apply \
+            -auto-approve \
+            tfplan
+
+
+# ============================================================
+# STAGE 2 - BUILD AND PUSH
+# ============================================================
+
+- stage: Build
+  displayName: Build and Push Docker Image
+
+  dependsOn: Terraform
+
+  jobs:
+
+  - job: BuildAndPush
+    displayName: Build and Push
+
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Build and Push Docker Image
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          set -e
+
+          echo "===================================="
+          echo "Azure Account"
+          echo "===================================="
+
+          az account show
+
+          echo "===================================="
+          echo "Login to ACR"
+          echo "===================================="
+
+          az acr login \
+            --name $(acrName)
+
+          echo "===================================="
+          echo "Build Docker Image"
+          echo "===================================="
+
+          docker build \
+            -t $(acrLoginServer)/$(imageRepository):$(imageTag) \
+            .
+
+          echo "===================================="
+          echo "Push Docker Image"
+          echo "===================================="
+
+          docker push \
+            $(acrLoginServer)/$(imageRepository):$(imageTag)
+
+          echo "===================================="
+          echo "IMAGE PUSHED"
+          echo "===================================="
+
+          echo "$(acrLoginServer)/$(imageRepository):$(imageTag)"
+
+
+# ============================================================
+# STAGE 3 - DEPLOY TO AKS
+# ============================================================
+
+- stage: Deploy
+  displayName: Deploy Application to AKS
+
+  dependsOn: Build
+
+  jobs:
+
+  - job: Deploy
+    displayName: Deploy to AKS
+
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Deploy Application
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          set -e
+
+          echo "===================================="
+          echo "Get AKS Credentials"
+          echo "===================================="
+
+          az aks get-credentials \
+            --resource-group $(aksResourceGroup) \
+            --name $(aksClusterName) \
+            --overwrite-existing
+
+          echo "===================================="
+          echo "AKS Nodes"
+          echo "===================================="
+
+          kubectl get nodes
+
+          echo "===================================="
+          echo "Create Namespace"
+          echo "===================================="
+
+          kubectl apply \
+            -f k8s/namespace.yaml
+
+          echo "===================================="
+          echo "Apply Deployment"
+          echo "===================================="
+
+          kubectl apply \
+            -f k8s/deployment.yaml
+
+          echo "===================================="
+          echo "Update Image"
+          echo "===================================="
+
+          kubectl set image \
+            deployment/fastapi \
+            fastapi=$(acrLoginServer)/$(imageRepository):$(imageTag) \
+            -n fastapi
+
+          echo "===================================="
+          echo "Apply Service"
+          echo "===================================="
+
+          kubectl apply \
+            -f k8s/service.yaml
+
+          echo "===================================="
+          echo "Wait For Rollout"
+          echo "===================================="
+
+          kubectl rollout status \
+            deployment/fastapi \
+            -n fastapi \
+            --timeout=180s
+
+          echo "===================================="
+          echo "Pods"
+          echo "===================================="
+
+          kubectl get pods \
+            -n fastapi \
+            -o wide
+
+          echo "===================================="
+          echo "Service"
+          echo "===================================="
+
+          kubectl get service \
+            -n fastapi
